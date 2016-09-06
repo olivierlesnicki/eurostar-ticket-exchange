@@ -8,6 +8,7 @@ var cookieParser = require('cookie-parser');
 var bodyParser = require('body-parser');
 
 const bot = require('./bot/index');
+const Ticket = require('./models/ticket');
 
 var app = express();
 
@@ -20,6 +21,51 @@ app.use(cookieParser());
 app.use(express.static(path.join(__dirname, 'tmp')));
 
 app.use('/', bot.router);
+
+app.get('/purchase/success/:user/:ticket', function (req, res) {
+  let recipient = {
+    id: req.params.user
+  };
+
+  Ticket.findOne({
+    _id: req.params.ticket
+  }).then(ticket => {
+    ticket.sold = true;
+    return ticket.save();
+  }).then(ticket => {
+    bot.send({
+      recipient,
+      message: {
+        text: `Thanks for your payment, here's your ticket:`
+      }
+    });
+    bot.send({
+      recipient,
+      message: {
+        attachment: {
+          type: 'file',
+          url: ticket.url
+        }
+      }
+    });
+    res.redirect(ticket.url);
+  });
+});
+
+app.get('/purchase/error/:user', function (req, res) {
+  let recipient = {
+    id: req.params.user
+  };
+
+  bot.send({
+    recipient,
+    message: {
+      text: 'It looks that the payment has failed. Your PayPal account wasn\'t debited. Is there anything I can help you with?'
+    }
+  });
+
+  res.send();
+});
 
 // catch 404 and forward to error handler
 app.use(function(req, res, next) {

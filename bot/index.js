@@ -1,7 +1,5 @@
 'use strict';
 
-const Bot = require('../lib/bot');
-
 const PDFImage = require('pdf-image').PDFImage;
 const async = require('asyncawait/async');
 const await = require('asyncawait/await');
@@ -11,9 +9,15 @@ const shortid = require('shortid');
 const fs = require('fs');
 const querystring = require('querystring');
 
-const Station = require('../model/station');
+const Ticket = require('../models/ticket');
+const Bot = require('../lib/bot');
+const scan = require('../lib/scan');
+const paypal = require('../lib/paypal');
 
-const redis = require('../lib/redis');
+const CURRENCIES = {
+  '£': 'GBP',
+  '€': 'EUR'
+};
 
 // Instantiate the bot
 const bot = new Bot({
@@ -48,50 +52,21 @@ bot.use('/sell-ticket/pdf', function (bot, entry) {
 
     if (entry.message && entry.message.attachments) {
       let pdf = entry.message.attachments.find(a => a.type === 'file');
-      await (download(pdf.payload.url).then(data => {
-        fs.writeFileSync(`tmp/${id}.pdf`, data);
-      }));
-
-      let gravities = ['NorthEast', 'SouthEast'];
-      let gravity = gravities.pop();
-      let data;
-
-      while (gravity && !data) {
-        let pdfImage = new PDFImage(`tmp/${id}.pdf`, {
-          convertOptions: {
-            '-density': 150,
-            '-depth': 96,
-            '-quality': 85,
-            '-gravity': gravity,
-            '-crop': '50%x50%+0+0'
-          }
-        });
-        await (pdfImage.convertPage(0));
-
-        data = await (fetch('http://zxing.org/w/decode?u=' + querystring.escape(`https://08b8b289.ngrok.io/${id}-0.png`))
-          .then(res => res.text())
-          .then(res => {
-            let m = res.match(/<pre>(.+)<\/pre>/i);
-            if (m && m[1]) {
-              return m[1].trim();
-            } else {
-              return '';
-            }
-          })
-        );
-
-        if (!data) {
-          fs.unlinkSync(`tmp/${id}-0.png`);
-        }
-
-        gravity = gravities.pop();
-      }
+      let url = pdf.payload.url;
+      let data = await (scan(url));
 
       if (!data) {
         await (bot.say('This doesn\'t look like a valid Eurostar ticket.'));
       } else {
-        await (bot.say(data));
-        await (bot.say(`https://08b8b289.ngrok.io/${id}-0.png`));
+        let ticket = new Ticket({
+          url,
+          user: entry.sender.id,
+          from: data.from,
+          to: data.to,
+          date: new Date(data.date)
+        });
+        await (ticket.save());
+        await (bot.ask('Great. How much do you want to charge for this ticket?', `/sell-ticket/${ticket._id}/price`));
       }
     }
   })();
@@ -100,18 +75,39 @@ bot.use('/sell-ticket/pdf', function (bot, entry) {
 bot.use('/sell-ticket/:id/price', function (bot, entry) {
   async (() => {
     if (entry.message.entities && entry.message.entities.amount_of_money) {
-      console.log(entry.message.entities.amount_of_money);
+      let ticket = await (Ticket.findOne({_id: entry.params.id}));
+
+      ticket.price = entry.message.entities.amount_of_money[0].value;
+      ticket.currency = CURRENCIES[entry.message.entities.amount_of_money[0].unit];
+
+      await (ticket.save());
+      await (bot.ask('What is your PayPal e-mail?'));
     }
   })();
 });
 
 bot.use('/sell-ticket/paypal-email', function (bot, entry) {
   async (() => {
-  })();
-});
+    let email = entry.message.text.trim();
+    let ticket = await (Ticket.findOne({_id: entry.params.id}));
+    let paymentUrl = await (paypal.fetchPaymentApprovalUrl({
+      currency: ticket.currency,
+      memo: 'Eurostar Ticket Exchange',
+      successURI: `${process.env.API_HOST}purchase/success/${entry.sender.id}/${ticket._id}`,
+      errorURI: `${process.env.API_HOST}purchase/error/${entry.sender.id}`,
+      receivers: [{
+        email,
+        amount: ticket.price,
+        primary: true
+      }]
+    }));
 
-bot.use('/buy-ticket', function (bot, entry) {
-  bot.say('I\'m afraid we\'ve ran out of ticket.');
+    ticket.paymentUrl = paymentUrl;
+    await (ticket.save());
+
+    await (bot.say('It\'s all done. I\'ll notify you as soon as someone buys your ticket and transfer the money in your PayPal account.'));
+    await (bot.say('If ever you sell your ticket through other means or decide to change its price let me know.'));
+  })();
 });
 
 
